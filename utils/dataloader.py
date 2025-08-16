@@ -142,8 +142,8 @@ class LoaderHook:
             val_dataset = Custom_Dataset(
                 input_list=self.val_input_list, 
                 target_list=self.val_target_list, 
-                patch_n=patch_n, 
-                patch_size=patch_size
+                patch_n=1, 
+                patch_size=512
             )
 
             return train_dataset, val_dataset
@@ -231,3 +231,4 @@ class LoaderHook:
 
         self.is_init = True
         return train_loader, val_loader
+

@@ -51,26 +51,32 @@ class Tester:
             norm_type=self.opt.norm_type,
         ).to(self.device)
         
-        ckpt_model = torch.load(self.opt.ckpt_path, map_location=self.device)
-        model.load_state_dict(ckpt_model["net_model"])
+        ckpt_model = torch.load(self.opt.ckpt_path, map_location=self.device, weights_only=False)
+        
+        state_dict = ckpt_model["net_model"]
+        state_dict = {k: v for k, v in state_dict.items() 
+                            if not k.endswith(('total_ops', 'total_params'))}
+        
+        model.load_state_dict(state_dict)
         model.eval()
         
         return model
 
+
     def _save_batch_images(self, data: torch.Tensor, recon: torch.Tensor, 
-                         target: torch.Tensor, batch_idx: int, text: str):
+                         target: torch.Tensor, batch_idx: int):
         
-        data_display = transfer_display_window(data, text)
-        recon_display = transfer_display_window(recon, text)
-        target_display = transfer_display_window(target, text)
+        data_display = transfer_display_window(data, self.use_dataset)
+        recon_display = transfer_display_window(recon, self.use_dataset)
+        target_display = transfer_display_window(target, self.use_dataset)
         
         data_path = os.path.join(self.output_root, f"input_{batch_idx}.png")
         recon_path = os.path.join(self.output_root, f"recon_{batch_idx}.png")
         target_path = os.path.join(self.output_root, f"target_{batch_idx}.png")
 
-        Image.fromarray(data_display.numpy().astype(np.uint8)).save(data_path)
-        Image.fromarray(recon_display.numpy().astype(np.uint8)).save(recon_path)
-        Image.fromarray(target_display.numpy().astype(np.uint8)).save(target_path)
+        Image.fromarray(data_display.squeeze().cpu().numpy().astype(np.uint8)).save(data_path)
+        Image.fromarray(recon_display.squeeze().cpu().numpy().astype(np.uint8)).save(recon_path)
+        Image.fromarray(target_display.squeeze().cpu().numpy().astype(np.uint8)).save(target_path)
 
     def test(self) -> Dict[str, float]:
         

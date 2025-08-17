@@ -1,5 +1,4 @@
 import numpy as np
-from PIL import Image
 import os
 from torch.utils.data import Dataset, DataLoader
 from glob import glob
@@ -9,7 +8,7 @@ from sklearn.model_selection import train_test_split
 
 DATASET_INFO = {
     "mayo16": {
-        "dir": "/data20tb1/qfj/Datasets/CT/mayo16/data_file/",
+        "dir": "/data20tb1/qfj/NPJ_Datasets/CT/mayo16/",
         "input_label": "*_input.npy", 
         "target_label": "*_target.npy",
         "test_patients": ['L506']
@@ -231,4 +230,3 @@ class LoaderHook:
 
         self.is_init = True
         return train_loader, val_loader
-

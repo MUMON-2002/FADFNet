@@ -66,7 +66,7 @@ class TestOptions():
         self.parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
         self.parser.add_argument('--ckpt_path', type=str, required = True, help='Path to trained and saved checkpoint model')
         self.parser.add_argument('--output_root', type=str, required = True, help='Path to save denoised imgs')
-        self.parser.add_argument('--use_datasets', type=str, default="mayo16", help='type of dataset, mayo16 or mayo20 or bern or ui')
+        self.parser.add_argument('--use_dataset', type=str, default="mayo16", help='type of dataset')
 
         self.parser.add_argument('--dim', type=int, default=64, help='Transformer block dimension')
         self.parser.add_argument('--norm_type', type=str, default="GN", help='which normalization type for the model to use, BN or GN or None')

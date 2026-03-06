@@ -1,7 +1,10 @@
 # FADFNet
 
-This repository contains the official PyTorch implementation of the paper: 
-**[FADFNet: A Fine-tunable and Adaptive Decomposition-Fusion Network for Cross-dataset Low-dose CT and Low-dose PET Image Reconstruction](https://doi.org/10.1016/j.media.2026.104016)**.
+This repository contains the official PyTorch implementation of the paper: **[FADFNet: A Fine-tunable and Adaptive Decomposition-Fusion Network for Cross-dataset Low-dose CT and Low-dose PET Image Reconstruction](https://doi.org/10.1016/j.media.2026.104016)**, accepted by Medical Image Analysis (MedIA) 🎉🎉🎉.
+
+<p align="center">
+  <img src="figs/network.png" width="800">
+</p>
 
 ## 1. Environment Setup
 
@@ -79,4 +82,5 @@ If you find this code or our paper useful for your research, please consider cit
 	issn = {1361-8415},
 }
 ```
+
 

@@ -1,401 +1,434 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-import numbers
+from einops import rearrange
 
 
-class XNet(nn.Module):
-    def __init__(self,
-                 inp_channels=1,
-                 out_channels=1,
-                 dim=64,
-                 activation="ReLU",
-                 norm_type="GN"
-                 ):
-        super(XNet, self).__init__()
-
-        self.levels = 4
-        self.norm_type = norm_type
-        self.activation = activation
-
-        # ---------- encoder-decoder a ----------
-        self.encoder_layers_a = nn.ModuleList()
-        self.downconv_layers_a = nn.ModuleList()
-
-        self.encoder_layers_a.append(ConvBlock(in_channels=inp_channels, out_channels=dim, activation=self.activation, norm_type=self.norm_type))
-        for i in range(1, self.levels):
-            self.downconv_layers_a.append(nn.MaxPool2d(kernel_size=2, stride=2))
-            self.encoder_layers_a.append(ConvBlock(in_channels=dim * 2**(i-1), out_channels=dim * 2**i, activation=self.activation, norm_type=self.norm_type))
-
-        self.upconv_layers_a = nn.ModuleList()
-        self.decoder_layers_a = nn.ModuleList()
-
-        for i in range(self.levels - 1, 0, -1):
-            self.upconv_layers_a.append(UpConv(in_channels=dim * 2**i, out_channels=dim * 2**(i-1), activation=self.activation, norm_type=None))
-            self.decoder_layers_a.append(ConvBlock(in_channels=dim * 2**i, out_channels=dim * 2**(i-1), activation=self.activation, norm_type=None))
-
-        self.finalconv_a = nn.Conv2d(dim, out_channels, kernel_size=1)
-
-        # ---------- encoder-decoder b ----------
-        self.encoder_layers_b = nn.ModuleList()
-        self.downconv_layers_b = nn.ModuleList()
-
-        self.encoder_layers_b.append(ConvBlock(in_channels=inp_channels, out_channels=dim, activation=self.activation, norm_type=self.norm_type))
-        for i in range(1, self.levels):
-            self.downconv_layers_b.append(nn.MaxPool2d(kernel_size=2, stride=2)),
-            self.encoder_layers_b.append(ConvBlock(in_channels=dim * 2**(i-1), out_channels=dim * 2**i, activation=self.activation, norm_type=self.norm_type))
-
-        self.upconv_layers_b = nn.ModuleList()
-        self.decoder_layers_b = nn.ModuleList()
-
-        for i in range(self.levels - 1, 0, -1):
-            self.upconv_layers_b.append(UpConv(in_channels=dim * 2**i, out_channels=dim * 2**(i-1), activation=self.activation, norm_type=None))
-            self.decoder_layers_b.append(ConvBlock(in_channels=dim * 2**i, out_channels=dim * 2**(i-1), activation=self.activation, norm_type=None))
-
-        self.finalconv_b = nn.Conv2d(dim, out_channels, kernel_size=1)
-
-        # ---------- intermidiate fusion ----------
-        self.inter_fusion = OTG_CrossAttentionFusion(in_channels=dim * 2 ** (self.levels - 1), norm_type=None)
-
-        # ---------- output fusion ----------
-        self.out_fusion = FeaturePyramidFusion(inp_channels=1, dim=dim)
-
-    def forward(self, inp_a, inp_b):
-
-        # ---------- encoder ----------
-        x_a = inp_a 
-        enc_outputs_a = []
-        for i, encoder_layer in enumerate(self.encoder_layers_a): 
-            x_a = encoder_layer(x_a)
-            enc_outputs_a.append(x_a)
-            if i < self.levels - 1: 
-                x_a = self.downconv_layers_a[i](x_a) 
-
-        x_b = inp_b 
-        enc_outputs_b = []
-        for i, encoder_layer in enumerate(self.encoder_layers_b): 
-            x_b = encoder_layer(x_b)
-            enc_outputs_b.append(x_b)
-            if i < self.levels - 1: 
-                x_b = self.downconv_layers_b[i](x_b) 
-
-        # ---------- inter fusion ----------
-        x_a, x_b = self.inter_fusion(x_a, x_b)
-
-        # ---------- decoder ----------
-        for i in range(self.levels - 1): 
-            x_a = self.upconv_layers_a[i](x_a) 
-            x_a = torch.cat((x_a, enc_outputs_a[-(i+2)]), dim=1) 
-            x_a = self.decoder_layers_a[i](x_a)
-
-        output_a = self.finalconv_a(x_a)
-
-        output_a = output_a + inp_a
-                
-        for i in range(self.levels - 1): 
-            x_b = self.upconv_layers_b[i](x_b) 
-            x_b = torch.cat((x_b, enc_outputs_b[-(i+2)]), dim=1) 
-            x_b = self.decoder_layers_b[i](x_b)
-
-        output_b = self.finalconv_b(x_b)
-        output_b = output_b + inp_b
-
-        # ---------- out fusion ----------
-        output = self.out_fusion(output_a, output_b)
-
-        return output
-
-
-class ConvBlock(nn.Module):
-
-    def __init__(self, in_channels, out_channels, activation="ReLU", norm_type=None):
-        super(ConvBlock, self).__init__()
-        
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.norm1 = get_norm_layer(norm_type, out_channels)
-        self.act1 = get_activation(activation)
-        
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.norm2 = get_norm_layer(norm_type, out_channels)
-        self.act2 = get_activation(activation)
-    
-    def forward(self, x):
-
-        x = self.act1(self.norm1(self.conv1(x)))
-        x = self.act2(self.norm2(self.conv2(x)))
-
-        return x
-
-
-class UpConv(nn.Module):
-
-    def __init__(self, in_channels, out_channels, activation="ReLU", norm_type=None):
-        super(UpConv, self).__init__()
-        
-        self.upconv = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.norm = get_norm_layer(norm_type, out_channels)
-        self.act = get_activation(activation)
-    
-    def forward(self, x):
-
-        return self.act(self.norm(self.upconv(x)))
-
-
-class OTG_CrossAttentionFusion(nn.Module):
-
-    def __init__(self, in_channels, norm_type=None):
-        super(OTG_CrossAttentionFusion, self).__init__()
-
-        self.alpha = nn.Parameter(torch.tensor(1.0))
-        self.beta = nn.Parameter(torch.tensor(1.0))
-
-        self.ot = OptimalTransport()
-
-        self.norm_a = get_norm_layer(norm_type, in_channels)
-        self.norm_b = get_norm_layer(norm_type, in_channels)
-        
-        self.qkv_A = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels * 3, kernel_size=1, bias=False),
-            nn.Conv2d(in_channels * 3, in_channels * 3, kernel_size=3, stride=1, padding=1, groups=in_channels * 3, bias=False)
-        )
-        self.out_A = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-
-        self.qkv_B = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels * 3, kernel_size=1, bias=False),
-            nn.Conv2d(in_channels * 3, in_channels * 3, kernel_size=3, stride=1, padding=1, groups=in_channels * 3, bias=False)
-        )
-        self.out_B = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-
-    def forward(self, inp_a, inp_b):
-        
-        B, C, H, W = inp_a.shape
-        identity_a = inp_a
-        identity_b = inp_b
-
-        inp_a = self.norm_a(inp_a)
-        inp_b = self.norm_b(inp_b)
-
-        Trans_a = self.ot(inp_a, inp_b).view(B, H, W, H, W) # (B, H_b, W_b, H_a, W_a)
-        Trans_b = self.ot(inp_b, inp_a).view(B, H, W, H, W) # (B, H_a, W_a, H_b, W_b)
-
-        qkv_a = self.qkv_A(inp_a).view(B, C * 3, H, W)
-        query_A, key_A, value_A = qkv_a.chunk(3, dim=1)
-        qkv_b = self.qkv_B(inp_b).view(B, C * 3, H, W)
-        query_B, key_B, value_B = qkv_b.chunk(3, dim=1)
-        
-        attn_A = torch.einsum("bchw, bcyx -> bhwyx", query_B, key_A).contiguous() / math.sqrt(C) # (B, H_b, W_b, H_a, W_a)
-        attn_A = attn_A + self.alpha * Trans_a
-        attn_A = torch.softmax(attn_A.view(B, H, W, -1), -1).view(B, H, W, H, W)
-        out_a = torch.einsum("bhwyx, bcyx -> bchw", attn_A, value_A).contiguous()
-        out_a = self.out_A(out_a) + identity_a
-
-        attn_B = torch.einsum("bchw, bcyx -> bhwyx", query_A, key_B).contiguous() / math.sqrt(C) # (B, H_a, W_a, H_b, W_b)
-        attn_B = attn_B + self.beta * Trans_b
-        attn_B = torch.softmax(attn_B.view(B, H, W, -1), -1).view(B, H, W, H, W)
-        out_b = torch.einsum("bhwyx, bcyx -> bchw", attn_B, value_B).contiguous()
-        out_b = self.out_B(out_b) + identity_b
-
-        return out_a, out_b
-    
-
-class OptimalTransport(nn.Module):
-
-    def __init__(self, reg=1e-1, max_iter=50, transport_ratio=0.8):
+class LayerNorm2d(nn.Module):
+    def __init__(self, channels, eps=1e-6):
         super().__init__()
-        self.reg = reg
-        self.max_iter = max_iter
-        self.transport_ratio = transport_ratio
-
-    def sinkhorn(self, a, b, cost_matrix, eps=1e-6):
-
-        K = torch.exp(-cost_matrix / self.reg).clamp(min=1e-8)
-
-        u = torch.ones_like(a)
-        v = torch.ones_like(b)
-
-        for _ in range(self.max_iter):
-            prev_u, prev_v = u.clone(), v.clone()
-            u = a / (torch.bmm(K, v.unsqueeze(2)).squeeze(2) + eps)
-            v = b / (torch.bmm(K.transpose(1, 2), u.unsqueeze(2)).squeeze(2) + eps)
-
-            err_u = torch.max(torch.abs(u - prev_u)).item()
-            err_v = torch.max(torch.abs(v - prev_v)).item()
-            if err_u < eps and err_v < eps:
-                break
-
-        transport_plan = u.unsqueeze(2) * K * v.unsqueeze(1)
-        return transport_plan
-
-    def forward(self, source, target):
-
-        B, C, H, W = source.shape
-        N = H * W
-        device = source.device
-        src = source.view(B, C, -1).permute(0, 2, 1) # (B, N, C)
-        tgt = target.view(B, C, -1).permute(0, 2, 1)
-
-        src_weights = torch.ones(B, N, device=device) * (self.transport_ratio / N)
-        tgt_weights = torch.ones(B, N, device=device) * (self.transport_ratio / N)
-        virtual_src_weight = torch.ones(B, 1, device=device) * (1 - self.transport_ratio)
-        virtual_tgt_weight = torch.ones(B, 1, device=device) * (1 - self.transport_ratio)
-        partial_src_weights = torch.cat([src_weights, virtual_src_weight], dim=1)
-        partial_tgt_weights = torch.cat([tgt_weights, virtual_tgt_weight], dim=1)
-
-        cost = torch.cdist(src, tgt, p=2) ** 2
-        virtual_cost = torch.quantile(cost.view(B, -1), q=0.75, dim=1)[0].unsqueeze(-1).unsqueeze(-1)
-
-        partial_cost = torch.zeros(B, N + 1, N + 1, device=device)
-        partial_cost[:, :N, :N] = cost
-        partial_cost[:, :N, N:] = virtual_cost.expand(B, N, 1)
-        partial_cost[:, N:, :N] = virtual_cost.expand(B, 1, N)
-
-        transport_plan = self.sinkhorn(partial_src_weights, partial_tgt_weights, partial_cost) 
-        
-        transport_plan = transport_plan[:, :N, :N]
-        transport_plan = transport_plan.permute(0, 2, 1)
-        transport_plan = transport_plan / transport_plan.sum(dim=2, keepdim=True)
-        
-        return transport_plan
+        self.weight = nn.Parameter(torch.ones(1, channels, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.eps = eps
+    
+    def forward(self, x):
+        mean = x.mean(1, keepdim=True)
+        var = x.var(1, keepdim=True, unbiased=False)
+        std = (var + self.eps).sqrt()
+        x = (x - mean) / std
+        x = x * self.weight + self.bias
+        return x
     
 
-class Embed_Fusion_3_3(nn.Module):
+class Downsample(nn.Module):
+    def __init__(self, in_dim):
+        super(Downsample, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_dim, in_dim, kernel_size=3, padding=1, groups=in_dim, bias=False),
+            nn.Conv2d(in_dim, in_dim // 2, kernel_size=1, bias=False),
+        )
+        self.unshuffle = nn.PixelUnshuffle(2)
 
-    def __init__(self, dim):
-        super(Embed_Fusion_3_3, self).__init__()
-
-        self.conv = nn.Conv2d(dim * 2, dim, kernel_size=3, padding=1)
-
-    def forward(self, inp_a, inp_b):
-        x = torch.concat([inp_a, inp_b], dim=1)
+    def forward(self, x):
         x = self.conv(x)
+        x = self.unshuffle(x)
         return x
 
 
-class Embed_Fusion_1_1(nn.Module):
+class Upsample(nn.Module):
+    def __init__(self, in_dim):
+        super(Upsample, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_dim, in_dim, kernel_size=3, padding=1, groups=in_dim, bias=False),
+            nn.Conv2d(in_dim, in_dim * 2, kernel_size=1, bias=False),
+        )
+        self.shuffle = nn.PixelShuffle(2)
 
-    def __init__(self, dim):
-        super(Embed_Fusion_1_1, self).__init__()
-
-        self.conv = nn.Conv2d(dim * 2, dim, kernel_size=1, stride=1, bias=False)
-
-    def forward(self, inp_a, inp_b):
-        x = torch.concat([inp_a, inp_b], dim=1)
+    def forward(self, x):
         x = self.conv(x)
+        x = self.shuffle(x)
         return x
 
 
-class FeaturePyramidFusion(nn.Module): 
+class SimpleGate(nn.Module):
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2
+
+
+class AVG_Attention(nn.Module):
+    def __init__(self, dim):
+        super(AVG_Attention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=1, padding=0, bias=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.avg_pool(x)
+        x = self.conv(x)
+        x = self.sigmoid(x)
+        return x
+
+
+class STD_Attention(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super(STD_Attention, self).__init__()
+        self.conv = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=1, padding=0, bias=True)
+        self.eps = eps
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        x = (torch.var(x, dim=[2, 3], keepdim=True, unbiased=False) + self.eps).sqrt()
+        x = self.conv(x)
+        x = self.sigmoid(x)
+        return x
     
-    def __init__(self, inp_channels, dim, activation="ReLU"): 
-        super(FeaturePyramidFusion, self).__init__() 
 
-        self.down_layer_1_A = nn.Sequential(
-            nn.Conv2d(inp_channels, dim, kernel_size=3, padding=1),
-            get_activation(activation),
-        )
-        self.down_layer_2_A = nn.Sequential(
-            nn.Conv2d(dim, dim * 2, kernel_size=3, padding=1),
-            get_activation(activation),
-            nn.MaxPool2d(kernel_size=2, stride=2)
-        )
-        self.down_layer_3_A = nn.Sequential(
-            nn.Conv2d(dim * 2, dim * 4, kernel_size=3, padding=1),
-            get_activation(activation),
-            nn.MaxPool2d(kernel_size=2, stride=2)
-        )
+class FuseBlock(nn.Module):
+    def __init__(self, dim, DW_Expand=2, FFN_Expand=2, bias=False):
+        super(FuseBlock, self).__init__()
+        self.dim = dim
+        dw_channel = dim * DW_Expand
+        ffn_channel = FFN_Expand * dim
+        self.patch_size = 8
 
-        self.down_layer_1_B = nn.Sequential(
-            nn.Conv2d(inp_channels, dim, kernel_size=3, padding=1),
-            get_activation(activation),
-        )
-        self.down_layer_2_B = nn.Sequential(
-            nn.Conv2d(dim, dim * 2, kernel_size=3, padding=1),
-            get_activation(activation),
-            nn.MaxPool2d(kernel_size=2, stride=2)
-        )
-        self.down_layer_3_B = nn.Sequential(
-            nn.Conv2d(dim * 2, dim * 4, kernel_size=3, padding=1),
-            get_activation(activation),
-            nn.MaxPool2d(kernel_size=2, stride=2)
-        )
+        self.norm1 = LayerNorm2d(dim)
+        self.to_hidden_1 = nn.Conv2d(dim, dw_channel * 3, kernel_size=1, bias=bias)
+        self.to_hidden_dw_1 = nn.Conv2d(dw_channel * 3, dw_channel * 3, kernel_size=3, padding=1, groups=dw_channel * 3, bias=bias)
+        self.norm2 = LayerNorm2d(dw_channel)
+        self.projection_1 = nn.Conv2d(dw_channel, dim, kernel_size=1, bias=bias)
 
-        self.up_layer_3 = nn.Sequential(
-            nn.Conv2d(dim * 4, dim * 2 * 4, kernel_size=3, padding=1),
-            nn.PixelShuffle(2),
-            get_activation(activation),
-        )
-        self.up_layer_2 = nn.Sequential(
-            nn.Conv2d(dim * 2, dim * 1 * 4, kernel_size=3, padding=1),
-            nn.PixelShuffle(2),
-            get_activation(activation),
-        )
-        self.up_layer_1 = nn.Sequential(
-            nn.Conv2d(dim * 1, inp_channels, kernel_size=3, stride=1, padding=1),
-            get_activation(activation),
-        )
+        self.norm3 = LayerNorm2d(dim)
+        self.to_hidden_2 = nn.Conv2d(in_channels=dim, out_channels=ffn_channel, kernel_size=1, padding=0, bias=True)
+        self.to_hidden_dw_2 = nn.Conv2d(ffn_channel, ffn_channel, kernel_size=3, padding=1, groups=ffn_channel, bias=bias)
+        self.projection_2 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=dim, kernel_size=1, padding=0, bias=False)
+        self.sg = SimpleGate()
 
-        self.add_fusion_1 = Embed_Fusion_1_1(dim)
-        self.add_fusion_2 = Embed_Fusion_1_1(dim * 2)
-        self.add_fusion_3 = Embed_Fusion_1_1(dim * 4)
+        self.scale_1 = nn.Parameter(torch.zeros((1, dim, 1, 1)), requires_grad=True)
+        self.scale_2 = nn.Parameter(torch.zeros((1, dim, 1, 1)), requires_grad=True)
 
-        self.embed_fusion_2 = Embed_Fusion_3_3(dim * 2)
-        self.embed_fusion_1 = Embed_Fusion_3_3(dim)
+    def forward(self, x):
+        B, C, H, W = x.shape
+        identity = x
+        x = self.norm1(x)
+
+        hidden = self.to_hidden_1(x)
+        q, k, v = self.to_hidden_dw_1(hidden).chunk(3, dim=1)
+
+        q_patch = rearrange(q, 'b c (h p1) (w p2) -> b c h w p1 p2', p1=self.patch_size, p2=self.patch_size)
+        k_patch = rearrange(k, 'b c (h p1) (w p2) -> b c h w p1 p2', p1=self.patch_size, p2=self.patch_size)
+        q_fft = torch.fft.rfft2(q_patch.float())
+        k_fft = torch.fft.rfft2(k_patch.float())
+        attn_fft = q_fft * k_fft
+
+        attn = torch.fft.irfft2(attn_fft, s=(self.patch_size, self.patch_size))
+        attn = rearrange(attn, 'b c h w p1 p2 -> b c (h p1) (w p2)', p1=self.patch_size, p2=self.patch_size)
+        attn = self.norm2(attn)
         
-    def forward(self, inp_a, inp_b):
-        c0 = inp_a + inp_b
+        out = v * attn
+        out = self.projection_1(out)
+        x = identity + out * self.scale_1 
 
-        c1_a = self.down_layer_1_A(inp_a)
-        c1_b = self.down_layer_1_B(inp_b)
+        identity = x
+        x = self.norm3(x)
+        x = self.to_hidden_2(x)
+        x = self.to_hidden_dw_2(x)
+        x = self.sg(x)
+        x = self.projection_2(x)
+        x = identity + x * self.scale_2 
+        return x
 
-        c1 = self.add_fusion_1(c1_a, c1_b)
 
-        c2_a = self.down_layer_2_A(c1_a)
-        c2_b = self.down_layer_2_B(c1_b)
-
-        c2 = self.add_fusion_2(c2_a, c2_b)
-
-        c3_a = self.down_layer_3_A(c2_a)
-        c3_b = self.down_layer_3_B(c2_b)
-
-        c3 = self.add_fusion_3(c3_a, c3_b)
+class FAEBlock(nn.Module):
+    def __init__(self, dim, attn_module=None, DW_Expand=2, FFN_Expand=2):
+        super(FAEBlock, self).__init__()
+        self.dim = dim
+        dw_channel = dim * DW_Expand
+        ffn_channel = FFN_Expand * dim
         
-        # Pyramid Fusion
-        c3 = self.up_layer_3(c3)
-
-        c2 = self.embed_fusion_2(c2, c3)
-        c2 = self.up_layer_2(c2)
+        # --- Conv Block ---
+        self.norm1 = LayerNorm2d(dim)
+        self.to_hidden_1 = nn.Conv2d(in_channels=dim, out_channels=dw_channel, kernel_size=1, padding=0, bias=False)
+        self.to_hidden_dw_1 = nn.Conv2d(in_channels=dw_channel, out_channels=dw_channel, kernel_size=3, padding=1, groups=dw_channel, bias=True)
+        self.projection_1 = nn.Conv2d(in_channels=dw_channel // 2, out_channels=dim, kernel_size=1, padding=0, bias=False)
         
-        c1 = self.embed_fusion_1(c1, c2)
-        c1 = self.up_layer_1(c1)
+        self.sg = SimpleGate()
+        self.attn = attn_module
 
-        output = c0 + c1 # residual connect
+        # --- FFN Block ---
+        self.norm2 = LayerNorm2d(dim)
+        self.to_hidden_2 = nn.Conv2d(in_channels=dim, out_channels=ffn_channel, kernel_size=1, padding=0, bias=True)
+        self.projection_2 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=dim, kernel_size=1, padding=0, bias=False)
+
+        self.scale_1 = nn.Parameter(torch.zeros((1, dim, 1, 1)), requires_grad=True)
+        self.scale_2 = nn.Parameter(torch.zeros((1, dim, 1, 1)), requires_grad=True)
+
+    def forward(self, x):
+        identity = x
+
+        x = self.norm1(x)
+        x = self.to_hidden_1(x)
+        x = self.to_hidden_dw_1(x)
+        x = self.sg(x)
+        if self.attn is not None:
+            x = x * self.attn(x)
+        x = self.projection_1(x)
+        x = identity + x * self.scale_1
+
+        identity = x
+        x = self.norm2(x)
+        x = self.to_hidden_2(x)
+        x = self.sg(x)
+        x = self.projection_2(x)
+        x = identity + x * self.scale_2
+        return x
+    
+    
+class LFBlocks(nn.Module):
+    def __init__(self, dim, num_blocks, DW_Expand=2, FFN_Expand=2):
+        super(LFBlocks, self).__init__()
+        self.layers = nn.ModuleList()
+        dw_channel = dim * DW_Expand
+        for _ in range(num_blocks):
+            attn_module = AVG_Attention(dim=dw_channel // 2)
+            self.layers.append(FAEBlock(dim=dim, attn_module=attn_module, DW_Expand=DW_Expand, FFN_Expand=FFN_Expand))
+    
+    def forward(self, x):
+        for _, layer in enumerate(self.layers):
+            x = layer(x)
+        return x
+
+
+class HFBlocks(nn.Module):
+    def __init__(self, dim, num_blocks, DW_Expand=2, FFN_Expand=2):
+        super(HFBlocks, self).__init__()
+        self.layers = nn.ModuleList()
+        dw_channel = dim * DW_Expand
+        for _ in range(num_blocks):
+            attn_module = STD_Attention(dim=dw_channel // 2)
+            self.layers.append(FAEBlock(dim=dim, attn_module=attn_module, DW_Expand=DW_Expand, FFN_Expand=FFN_Expand))
+    
+    def forward(self, x):
+        for _, layer in enumerate(self.layers):
+            x = layer(x)
+        return x
+
+
+class FuseBlocks(nn.Module):
+    def __init__(self, dim, num_blocks, DW_Expand=2, FFN_Expand=2):
+        super(FuseBlocks, self).__init__()
+        self.layers = nn.ModuleList()
+        for _ in range(num_blocks):
+            self.layers.append(FuseBlock(dim=dim, DW_Expand=DW_Expand, FFN_Expand=FFN_Expand))
+    
+    def forward(self, x):
+        for _, layer in enumerate(self.layers):
+            x = layer(x)
+        return x
+    
+
+class PyramidFusionModule(nn.Module):
+    def __init__(self, dim, out_channels, num_blocks):
+        super(PyramidFusionModule, self).__init__()
+        self.reduction_3 = nn.Conv2d(dim * 8, dim * 4, kernel_size=1, bias=False)
+        self.fuse_block_3 = FuseBlocks(dim * 4, num_blocks=num_blocks[2])
+        self.up_3 = Upsample(dim * 4)
+
+        self.reduction_2 = nn.Conv2d(dim * 6, dim * 2, kernel_size=1, bias=False)
+        self.fuse_block_2 = FuseBlocks(dim * 2, num_blocks=num_blocks[1])
+        self.up_2 = Upsample(dim * 2)
+
+        self.reduction_1 = nn.Conv2d(dim * 3, dim, kernel_size=1, bias=False)
+        self.fuse_block_1 = FuseBlocks(dim, num_blocks=num_blocks[0])
+        
+        self.final_conv = nn.Conv2d(in_channels=dim, out_channels=out_channels, kernel_size=3, padding=1, bias=True)
+
+    def forward(self, features_a, features_b):
+        x_a1, x_a2, x_a3 = features_a
+        x_b1, x_b2, x_b3 = features_b
+        
+        x3 = self.reduction_3(torch.cat((x_a3, x_b3), dim=1))
+        x3 = self.fuse_block_3(x3)
+        x3_up = self.up_3(x3)
+
+        x2 = self.reduction_2(torch.cat((x3_up, x_a2, x_b2), dim=1))
+        x2 = self.fuse_block_2(x2)
+        x2_up = self.up_2(x2)
+
+        x1 = self.reduction_1(torch.cat((x2_up, x_a1, x_b1), dim=1))
+        x1 = self.fuse_block_1(x1)
+
+        output = self.final_conv(x1)
         return output
+    
+
+class SCAModulation(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super(SCAModulation, self).__init__()
+        self.spatial_gen = nn.Sequential(
+            nn.Conv2d(in_dim, in_dim, kernel_size=3, padding=1, groups=in_dim, bias=False),
+            nn.Conv2d(in_dim, out_dim * 2, kernel_size=1)
+        )
+        self.channel_gen = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_dim, in_dim // 2, kernel_size=1, bias=False),
+            nn.Conv2d(in_dim // 2, out_dim * 2, kernel_size=1)
+        )
+
+        nn.init.zeros_(self.spatial_gen[-1].weight)
+        nn.init.zeros_(self.spatial_gen[-1].bias)
+        nn.init.zeros_(self.channel_gen[-1].weight)
+        nn.init.zeros_(self.channel_gen[-1].bias)
+
+    def forward(self, guide, x):
+        spatial_params = self.spatial_gen(guide)
+        channel_params = self.channel_gen(guide)
+        params = spatial_params + channel_params
+
+        gamma, beta = torch.chunk(params, 2, dim=1)
+        x = x * (1.0 + gamma) + beta
+        return x
 
 
-def get_norm_layer(norm_type, dim):
+class Denoising_Network(nn.Module):
+    def __init__(self, img_channels=1, out_channels=1, dim=64, num_blocks_a=[1, 1, 3, 1], num_blocks_b=[1, 1, 3, 1], fusion_blocks=[1, 1, 1]):
+        super(Denoising_Network, self).__init__()
+        # -------------------- Branch A (Source/Structure) --------------------
+        self.proj_conv_a = nn.Conv2d(img_channels, dim, kernel_size=3, stride=1, padding=1, bias=False)
+        self.enc_1_a = LFBlocks(dim, num_blocks=num_blocks_a[0])
+        
+        self.enc_down1_a = Downsample(dim)
+        self.enc_2_a = LFBlocks(dim * 2, num_blocks=num_blocks_a[1])
+        
+        self.enc_down2_a = Downsample(dim * 2)
+        self.enc_3_a = LFBlocks(dim * 4, num_blocks=num_blocks_a[2])
+        
+        self.enc_down3_a = Downsample(dim * 4)
+        self.enc_bott_a = LFBlocks(dim * 8, num_blocks=num_blocks_a[3])
 
-    assert norm_type in ["BN", "GN", "IN", None]
+        self.dec_up3_a = Upsample(dim * 8)
+        self.dec_reduce3_a = nn.Conv2d(dim * 8, dim * 4, kernel_size=1, bias=False)
+        self.dec_dec3_a = LFBlocks(dim * 4, num_blocks=num_blocks_a[2])
 
-    if norm_type == "BN":
-        return nn.BatchNorm2d(dim)
-    elif norm_type == "GN":
-        return nn.GroupNorm(num_groups=8, num_channels=dim)
-    elif norm_type == "IN":
-        return nn.InstanceNorm2d(dim)
-    else:
-        return nn.Identity()
+        self.dec_up2_a = Upsample(dim * 4)
+        self.dec_reduce2_a = nn.Conv2d(dim * 4, dim * 2, kernel_size=1, bias=False)
+        self.dec_dec2_a = LFBlocks(dim * 2, num_blocks=num_blocks_a[1])
 
+        self.dec_up1_a = Upsample(dim * 2)
+        self.dec_reduce1_a = nn.Conv2d(dim * 2, dim * 1, kernel_size=1, bias=False)
+        self.dec_dec1_a = LFBlocks(dim * 1, num_blocks=num_blocks_a[0])
 
-def get_activation(activation, negative_slope=0.1):
+        self.final_conv_a = nn.Conv2d(in_channels=dim, out_channels=out_channels, kernel_size=3, padding=1, bias=True)
 
-    assert activation in ["ReLU", "GeLU", "LeakyReLU", None]
+        # -------------------- Branch B (Target/Texture) --------------------
+        self.proj_conv_b = nn.Conv2d(img_channels, dim, kernel_size=3, stride=1, padding=1, bias=False)
+        self.enc_1_b = HFBlocks(dim, num_blocks=num_blocks_b[0])
 
-    if activation == "ReLU":
-        return nn.ReLU(inplace=True)
-    elif activation == "GeLU":
-        return nn.GELU()
-    elif activation == "LeakyReLU":
-        return nn.LeakyReLU(negative_slope=negative_slope, inplace=True)
-    else:
-        return nn.Identity()
+        self.enc_down1_b = Downsample(dim)
+        self.enc_2_b = HFBlocks(dim * 2, num_blocks=num_blocks_b[1])
+
+        self.enc_down2_b = Downsample(dim * 2)
+        self.enc_3_b = HFBlocks(dim * 4, num_blocks=num_blocks_b[2])
+
+        self.enc_down3_b = Downsample(dim * 4)
+        self.enc_bott_b = HFBlocks(dim * 8, num_blocks=num_blocks_b[3])
+
+        self.dec_up3_b = Upsample(dim * 8)
+        self.dec_reduce3_b = nn.Conv2d(dim * 8, dim * 4, kernel_size=1, bias=False)
+        self.dec_dec3_b = HFBlocks(dim * 4, num_blocks=num_blocks_b[2])
+
+        self.dec_up2_b = Upsample(dim * 4)
+        self.dec_reduce2_b = nn.Conv2d(dim * 4, dim * 2, kernel_size=1, bias=False)
+        self.dec_dec2_b = HFBlocks(dim * 2, num_blocks=num_blocks_b[1])
+
+        self.dec_up1_b = Upsample(dim * 2)
+        self.dec_reduce1_b = nn.Conv2d(dim * 2, dim * 1, kernel_size=1, bias=False)
+        self.dec_dec1_b = HFBlocks(dim * 1, num_blocks=num_blocks_b[0])
+
+        self.final_conv_b = nn.Conv2d(in_channels=dim, out_channels=out_channels, kernel_size=3, padding=1, bias=True)
+
+        # -------------------- Fusion & Modulation --------------------
+        self.final_fusion = PyramidFusionModule(dim, out_channels, fusion_blocks)
+
+        self.enc_mod_1 = SCAModulation(dim, dim)
+        self.enc_mod_2 = SCAModulation(dim * 2, dim * 2)
+        self.enc_mod_3 = SCAModulation(dim * 4, dim * 4)
+
+        self.bott_mod = SCAModulation(dim * 8, dim * 8)
+
+        self.dec_mod_3 = SCAModulation(dim * 4, dim * 4)
+        self.dec_mod_2 = SCAModulation(dim * 2, dim * 2)
+        self.dec_mod_1 = SCAModulation(dim, dim)
+
+    def forward(self, inp_a, inp_b, input):
+        # -------------------- Branch A --------------------
+        x_a = self.proj_conv_a(inp_a)
+        enc_out_1_a = self.enc_1_a(x_a)
+
+        x_a = self.enc_down1_a(enc_out_1_a)
+        enc_out_2_a = self.enc_2_a(x_a)
+
+        x_a = self.enc_down2_a(enc_out_2_a)
+        enc_out_3_a = self.enc_3_a(x_a)
+
+        x_a = self.enc_down3_a(enc_out_3_a)
+        bott_a = self.enc_bott_a(x_a)
+
+        x_a = self.dec_up3_a(bott_a)
+        x_a = self.dec_reduce3_a(torch.cat((x_a, enc_out_3_a), dim=1))
+        dec_out_3_a = self.dec_dec3_a(x_a)
+
+        x_a = self.dec_up2_a(dec_out_3_a)
+        x_a = self.dec_reduce2_a(torch.cat((x_a, enc_out_2_a), dim=1))
+        dec_out_2_a = self.dec_dec2_a(x_a)
+
+        x_a = self.dec_up1_a(dec_out_2_a)
+        x_a = self.dec_reduce1_a(torch.cat((x_a, enc_out_1_a), dim=1))
+        dec_out_1_a = self.dec_dec1_a(x_a)
+
+        # -------------------- Branch B --------------------
+        x_b = self.proj_conv_b(inp_b)
+        x_b = self.enc_mod_1(guide=enc_out_1_a, x=x_b)
+        enc_out_1_b = self.enc_1_b(x_b)
+
+        x_b = self.enc_down1_b(enc_out_1_b)
+        x_b = self.enc_mod_2(guide=enc_out_2_a, x=x_b)
+        enc_out_2_b = self.enc_2_b(x_b)
+
+        x_b = self.enc_down2_b(enc_out_2_b)
+        x_b = self.enc_mod_3(guide=enc_out_3_a, x=x_b)
+        enc_out_3_b = self.enc_3_b(x_b)
+
+        x_b = self.enc_down3_b(enc_out_3_b)
+        x_b = self.bott_mod(guide=bott_a, x=x_b)
+        bott_b = self.enc_bott_b(x_b)
+
+        x_b = self.dec_up3_b(bott_b)
+        x_b = self.dec_reduce3_b(torch.cat((x_b, enc_out_3_b), dim=1))
+        x_b = self.dec_mod_3(guide=dec_out_3_a, x=x_b)
+        dec_out_3_b = self.dec_dec3_b(x_b)
+
+        x_b = self.dec_up2_b(dec_out_3_b)
+        x_b = self.dec_reduce2_b(torch.cat((x_b, enc_out_2_b), dim=1))
+        x_b = self.dec_mod_2(guide=dec_out_2_a, x=x_b)
+        dec_out_2_b = self.dec_dec2_b(x_b)
+
+        x_b = self.dec_up1_b(dec_out_2_b)
+        x_b = self.dec_reduce1_b(torch.cat((x_b, enc_out_1_b), dim=1))
+        x_b = self.dec_mod_1(guide=dec_out_1_a, x=x_b)
+        dec_out_1_b = self.dec_dec1_b(x_b)
+        
+        # -------------------- Fusion Forward --------------------
+        center_a = inp_a[:, 1:2, :, :] if inp_a.shape[1] == 3 else inp_a
+        center_b = inp_b[:, 1:2, :, :] if inp_b.shape[1] == 3 else inp_b
+        center = input[:, 1:2, :, :] if input.shape[1] == 3 else input
+
+        output_a = self.final_conv_a(dec_out_1_a) + center_a
+        output_b = self.final_conv_b(dec_out_1_b) + center_b
+
+        features_a = [dec_out_1_a, dec_out_2_a, dec_out_3_a]
+        features_b = [dec_out_1_b, dec_out_2_b, dec_out_3_b]
+        output = self.final_fusion(features_a, features_b)
+
+        output = output + center
+        return output, output_a, output_b

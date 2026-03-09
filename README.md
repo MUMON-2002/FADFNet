@@ -77,10 +77,14 @@ If you find this code or our paper useful for your research, please consider cit
 	title = {FADFNet: A Fine-tunable and Adaptive Decomposition-Fusion Network for Cross-dataset Low-dose CT and Low-dose PET Image Reconstruction},
 	author = {Fangji Qian and Weitao Wang and Yanyan Huang and Meng Niu and Yuanxue Gao and Zihao Zhao and Kuangyu Shi and Lequan Yu and Yu Fu and Cheng Zhuo},
 	journal = {Medical Image Analysis},
+	volume = {111},
 	pages = {104016},
 	year = {2026},
 	issn = {1361-8415},
 }
 ```
+
+
+
 
 
